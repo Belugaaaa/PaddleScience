@@ -27,6 +27,61 @@ from pathlib import Path
 import numpy as np
 
 
+def quantized_qkv_attention(
+    q, k, v, indices, block_size, query_chunk_size=8, recompute_chunks=False
+):
+    """Diagnostic: source Q/K/V rounding, joint FP32 softmax, no P rounding."""
+    import paddle
+    from einops import rearrange
+
+    if recompute_chunks or paddle.is_grad_enabled():
+        raise RuntimeError("QKV quantization diagnostic requires inference no_grad")
+    with paddle.amp.auto_cast(enable=False):
+        batch, length, heads, dim = k.shape
+        blocks = length // block_size
+        count = indices.shape[-1]
+        offsets = (
+            paddle.arange(batch * heads, dtype="int64").reshape([batch, heads, 1, 1])
+            * blocks
+        )
+        choices = indices.transpose([0, 2, 1, 3]) + offsets
+        banks = [
+            rearrange(
+                t.astype("bfloat16").astype("float32"),
+                "b (n s) h d -> (b h n) s d",
+                s=block_size,
+            )
+            for t in (k, v)
+        ]
+        query = (
+            ((q.astype("float32") * dim**-0.5) * 1.44269504089)
+            .astype("bfloat16")
+            .astype("float32")
+        )
+        query = rearrange(
+            query, "b (n s) (h g) d -> b h n g s d", s=block_size, h=heads
+        )
+        outputs = []
+        for start in range(0, blocks, query_chunk_size):
+            stop = min(start + query_chunk_size, blocks)
+            rows = choices[:, :, start:stop].flatten()
+            keys, values = [
+                paddle.gather(bank, rows)
+                .reshape([batch, heads, stop - start, count * block_size, dim])
+                .unsqueeze(3)
+                for bank in banks
+            ]
+            scores = paddle.matmul(
+                query[:, :, start:stop], keys, transpose_y=True
+            ) * np.log(2)
+            outputs.append(
+                paddle.matmul(paddle.nn.functional.softmax(scores, axis=-1), values)
+            )
+        return rearrange(
+            paddle.concat(outputs, axis=2), "b h n g s d -> b (n s) (h g) d"
+        ).astype(q.dtype)
+
+
 def online_sparse_attention(
     q, k, v, indices, block_size, query_chunk_size=8, recompute_chunks=False
 ):

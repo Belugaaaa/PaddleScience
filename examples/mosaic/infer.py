@@ -65,12 +65,17 @@ def main(args):
     model.eval()
     model.to(device=args.device)
     paddle.set_device(args.device)
-    if args.sparse_backend == "native-emulation":
+    if args.sparse_backend in ("native-emulation", "qkv-bf16"):
         from validate_sparse_kernel import online_sparse_attention
+        from validate_sparse_kernel import quantized_qkv_attention
 
         from ppsci.arch import mosaic_attention
 
-        mosaic_attention.sparse_attention = online_sparse_attention
+        mosaic_attention.sparse_attention = (
+            online_sparse_attention
+            if args.sparse_backend == "native-emulation"
+            else quantized_qkv_attention
+        )
     sample, stats, static = (
         np.load(args.data),
         np.load(args.stats),
@@ -235,9 +240,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--sparse-backend",
-        choices=("math", "native-emulation"),
+        choices=("math", "native-emulation", "qkv-bf16"),
         default="math",
-        help="native-emulation is an inference-only diagnostic, not a training backend",
+        help="native-emulation and qkv-bf16 are inference-only diagnostics, not training backends",
     )
     parser.add_argument(
         "--reference-trace", type=Path, help="Diagnostic geometry replay only"

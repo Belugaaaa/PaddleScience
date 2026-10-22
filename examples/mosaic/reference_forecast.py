@@ -157,6 +157,13 @@ def main(args):
         explicit_noise, model.noise_generator
     )
     trace = Trace(args.output / "trace") if args.trace else None
+    sparse_diagnostics = None
+    if args.sparse_diagnostics or args.sparse_sensitivity:
+        if args.sparse_backend != "native" or args.amp_dtype != "float32":
+            raise ValueError("Sparse diagnostics require native FP32 reference")
+        from sparse_diagnostics import install_diagnostics
+
+        sparse_diagnostics = install_diagnostics(sensitivity=args.sparse_sensitivity)
     if args.sparse_fixture:
         import primitives
 
@@ -259,6 +266,17 @@ def main(args):
             rmse=float(np.sqrt(np.mean(delta**2))),
         )
     args.output.mkdir(parents=True, exist_ok=True)
+    if sparse_diagnostics is not None:
+        (args.output / "sparse_diagnostics.json").write_text(
+            json.dumps(
+                dict(
+                    calls=sparse_diagnostics,
+                    scope="fixed native input/routes at every call; alternative outputs never feed subsequent layers; forward only, not training or speed validation",
+                ),
+                indent=2,
+            )
+        )
+        report["sparse_diagnostics"] = True
     if trace is not None:
         trace.save()
     np.savez(args.output / "reference.npz", normalized=normalized)
@@ -279,6 +297,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--paddle-prediction", type=Path)
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--sparse-diagnostics", action="store_true")
+    parser.add_argument(
+        "--sparse-sensitivity",
+        action="store_true",
+        help="Add fixed-route one-ULP Q perturbations to sparse diagnostics",
+    )
     parser.add_argument(
         "--sparse-fixture",
         type=Path,

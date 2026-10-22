@@ -237,3 +237,24 @@ python-paddle examples/mosaic/validate_sparse_kernel.py --framework paddle \
 ```
 
 固定输入 `[1,512,4,64]`、两组 KV heads、块长 128、每次选 3 块，数学 Paddle 算子对原 Triton 的 max diff 为 `0.00276860`，按原版 BF16 转换和逐块在线 softmax 顺序模拟后为 `0.000205725`（平均差 `2.41152e-7`）。仍非逐位一致，且未验证自定义反向；该模拟仅在示例诊断代码中，不替换架构中的可微数学 attention。
+
+### 超线样本的逐调用量化与敏感性诊断
+
+`reference_forecast.py --sparse-diagnostics` 在原版完整预报的每次稀疏调用中固定相同 Q/K/V 和路由，比较独立数学 attention、仅QKV量化、BF16在线softmax。每次仍返回原内核输出，替代结果不反馈后续层；`--sparse-sensitivity` 还将Q各元素朝正无穷方向移动一个FP32 ULP，保持K/V/路由不变，测量原内核与数学attention的局部响应。两开关仅支持FP32/native参考，不验证反向，也不能用于速度benchmark。
+
+```bash
+# 沿用上面的完整 reference_forecast.py 命令，增加：
+# --sparse-sensitivity --output /path/to/new_diagnostic
+# 逐调用结果保存在 new_diagnostic/sparse_diagnostics.json
+```
+
+2026-10-22 春/夏样本各14次调用：固定实际原版输入，BF16在线模拟相对原始内核的算子RMSE比数学实现降低约156–1328倍；但仍有残余差异。诊断开启/关闭的最终原版预报逐点完全相同。最敏感的均为调用12（0起始）：
+
+| 样本 | Q最大单ULP变化 | 跨BF16舍入边界的Q元素 | 原内核局部输出最大变化 | 数学attention局部输出最大变化 |
+| --- | ---: | ---: | ---: | ---: |
+| 春季 | 7.63e-6 | 622 / 37,748,736 | 0.08050 | 0.0003073 |
+| 夏季 | 7.63e-6 | 644 / 37,748,736 | 0.22717 | 0.0002892 |
+
+这里是**局部注意力激活**，不是完整模型归一化预报或天气RMSE。人工朝同一方向的ULP扰动不等于实际跨框架误差分布，但证明即使固定路由，BF16舍入边界也能放大微小输入误差；不能把全部差异仅归为top-k路由，或只依据隔离算子改善就认定整网对齐。
+
+完整Paddle独立推理中，`--sparse-backend native-emulation` 的春/夏最差天气RMSE退化反而为2.96705%/1.59630%（3/7变量超限）；新增 `--sparse-backend qkv-bf16` 只保留QKV量化、全选块联合FP32 softmax，分别2.08862%/1.33539%（4/2变量超限）。两者均未改善默认数学路径，不作为修复或验收结果。`qkv-bf16` 与 `native-emulation` 均强制inference-only、禁止用于LoRA或全参数训练；默认仍是可微数学attention。新增CPU测试用独立dense mask核对QKV量化GQA/gather，并验证训练调用被拒绝。
