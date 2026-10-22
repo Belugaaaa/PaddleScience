@@ -119,6 +119,7 @@ def main(args):
                 actual=str(actual_dir),
                 reference=str(reference_dir),
                 actual_backend=actual_meta.get("sparse_backend", "math"),
+                actual_adapter=actual_meta.get("adapter_directory"),
                 reference_backend=reference_meta["sparse_backend"],
                 actual_amp=actual_meta.get("amp_dtype", "float32"),
                 reference_amp=reference_meta.get("amp_dtype", "float32"),

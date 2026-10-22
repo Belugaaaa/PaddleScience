@@ -56,12 +56,28 @@ def attention(q, k, v):
     return paddle.matmul(probs, v).transpose([0, 2, 1, 3])
 
 
-def block_attention(q, k, v, block_size):
+def block_attention(q, k, v, block_size, recompute_chunks=False):
     batch = q.shape[0]
     q, k, v = [
         rearrange(x, "b (n s) h d -> (b n) s h d", s=block_size) for x in (q, k, v)
     ]
-    return rearrange(attention(q, k, v), "(b n) s h d -> b (n s) h d", b=batch)
+    if recompute_chunks:
+        from paddle.distributed.fleet.utils import recompute
+
+        outputs = [
+            recompute(
+                attention,
+                q[start : start + 2],
+                k[start : start + 2],
+                v[start : start + 2],
+                use_reentrant=False,
+            )
+            for start in range(0, q.shape[0], 2)
+        ]
+        out = paddle.concat(outputs, axis=0)
+    else:
+        out = attention(q, k, v)
+    return rearrange(out, "(b n) s h d -> b (n s) h d", b=batch)
 
 
 @paddle.no_grad()
@@ -78,7 +94,23 @@ def attn_topk(q, k, count):
     return paddle.topk(scores.transpose([0, 2, 1, 3]), count, axis=-1)[1]
 
 
-def sparse_attention(q, k, v, indices, block_size, query_chunk_size=8):
+def _selected_chunk(queries, key_bank, value_bank, indices, count, block_size):
+    batch, heads, chunks = indices.shape[:3]
+    dim = key_bank.shape[-1]
+    keys, values = [
+        paddle.gather(bank, indices.flatten(), axis=0).reshape(
+            [batch, heads, chunks, count * block_size, dim]
+        )
+        for bank in (key_bank, value_bank)
+    ]
+    scores = paddle.matmul(queries, keys.unsqueeze(3), transpose_y=True) * (dim**-0.5)
+    weights = F.softmax(scores.astype("float32"), axis=-1).astype(values.dtype)
+    return paddle.matmul(weights, values.unsqueeze(3))
+
+
+def sparse_attention(
+    q, k, v, indices, block_size, query_chunk_size=8, recompute_chunks=False
+):
     """Gather selected keys per query block and KV head, then attend jointly.
 
     q: [B,N,Hq,D], k/v: [B,N,Hkv,D], indices: [B,N/S,Hkv,K].
@@ -101,33 +133,50 @@ def sparse_attention(q, k, v, indices, block_size, query_chunk_size=8):
     outputs = []
     for start in range(0, blocks, query_chunk_size):
         stop = min(start + query_chunk_size, blocks)
-        chunk_indices = flat_indices[:, :, start:stop].flatten()
-        keys, values = [
-            paddle.gather(bank, chunk_indices, axis=0).reshape(
-                [batch, kv_heads, stop - start, count * block_size, dim]
-            )
-            for bank in banks
-        ]
-        scores = paddle.matmul(
-            queries[:, :, start:stop], keys.unsqueeze(3), transpose_y=True
-        ) * (dim**-0.5)
-        weights = F.softmax(scores.astype("float32"), axis=-1).astype(v.dtype)
-        outputs.append(paddle.matmul(weights, values.unsqueeze(3)))
+        args = (
+            queries[:, :, start:stop],
+            *banks,
+            flat_indices[:, :, start:stop],
+            count,
+            block_size,
+        )
+        if recompute_chunks:
+            from paddle.distributed.fleet.utils import recompute
+
+            outputs.append(recompute(_selected_chunk, *args, use_reentrant=False))
+        else:
+            outputs.append(_selected_chunk(*args))
     out = paddle.concat(outputs, axis=2)
     return rearrange(out, "b h n g s d -> b (n s) (h g) d")
 
 
 def mosaic_attention(
-    q, k, v, weights, local_size, sparse_size, count, local_only, no_compression=False
+    q,
+    k,
+    v,
+    weights,
+    local_size,
+    sparse_size,
+    count,
+    local_only,
+    no_compression=False,
+    recompute_chunks=False,
 ):
-    local = block_attention(q, k, v, local_size)
+    local = block_attention(q, k, v, local_size, recompute_chunks)
     if local_only:
         return local
     qc, kc = [
         reduce(x, "b (n s) h d -> b n h d", "mean", s=sparse_size) for x in (q, k)
     ]
     if no_compression:
-        selected = sparse_attention(q, k, v, attn_topk(qc, kc, count), sparse_size)
+        selected = sparse_attention(
+            q,
+            k,
+            v,
+            attn_topk(qc, kc, count),
+            sparse_size,
+            recompute_chunks=recompute_chunks,
+        )
         total = weights[0] + weights[2] + 1e-8
         return (local * weights[0] + selected * weights[2]) / total
     vc = reduce(v, "b (n s) h d -> b n h d", "mean", s=sparse_size)
@@ -135,7 +184,14 @@ def mosaic_attention(
     if count == 0:
         total = weights[0] + weights[1] + 1e-8
         return (local * weights[0] + compressed * weights[1]) / total
-    selected = sparse_attention(q, k, v, attn_topk(qc, kc, count), sparse_size)
+    selected = sparse_attention(
+        q,
+        k,
+        v,
+        attn_topk(qc, kc, count),
+        sparse_size,
+        recompute_chunks=recompute_chunks,
+    )
     return local * weights[0] + compressed * weights[1] + selected * weights[2]
 
 
@@ -172,6 +228,7 @@ class MosaicAttention(nn.Layer):
     def __init__(self, cfg, stage, local_only):
         super().__init__()
         self.local_only = local_only
+        self.enable_recompute = False
         self.no_compression = cfg.no_compression
         self.local_size = stage.block_attn_size
         self.sparse_size = stage.sparse_block_size
@@ -217,6 +274,7 @@ class MosaicAttention(nn.Layer):
             self.count,
             self.local_only,
             self.no_compression,
+            self.enable_recompute and self.training and paddle.is_grad_enabled(),
         )
         return self.to_o(rearrange(out, "b s h d -> s b (h d)"))
 

@@ -56,7 +56,34 @@ CPU 小配置三路 attention、no-compression、无选块/无噪声路径都已
 
 保留原版几何后第一层线性投影完全一致，仍有一组 top-k 选块集合不同。其余若干索引差异只是集合内顺序不同。固定路由结果不能作为独立推理验收，所有结果仍仅限单样本。不能断言剩余误差完全由路由造成。
 
-真实数据训练/正式评估、滚动预测、完整模型 CINN 和 CI 尚待完成。
+上面的逐点精度为历史诊断，不等于下面的天气任务指标。当前已补有限样本滚动预测和完整模型 CINN 探测，但正式评估、原版内核逐点对齐与 CI 仍未完成。
+
+### LoRA 微调验证（甲方允许的训练路线）
+
+`train_smoke.py` 提供全参数或 LoRA 的真实输入训练检查。LoRA 只适配 Transformer attention 的 Q/V 和 FFN 两个线性层，冻结其余全部权重；默认使用可选的 block、局部/选块注意力和插值重计算降低训练显存。重计算只在训练且开启梯度时生效，不改变原生 checkpoint 的参数名或默认推理路径。
+
+```bash
+python-paddle examples/mosaic/train_smoke.py \
+  --model /path/to/paddle-era5-source-geometry \
+  --static /path/to/static_vars.npz --stats /path/to/norm_stats_era5.npz \
+  --data /path/to/era5_three_samples.npz --output /path/to/lora_run \
+  --device gpu:0 --sample-index 1 --steps 3 \
+  --lora-rank 8 --lora-alpha 16 --learning-rate 0.001
+
+python-paddle examples/mosaic/infer.py \
+  --model /path/to/paddle-era5-source-geometry --adapter /path/to/lora_run \
+  --static /path/to/static_vars.npz --stats /path/to/norm_stats_era5.npz \
+  --data /path/to/era5_three_samples.npz --sample-index 2 \
+  --device gpu:0 --output /path/to/lora_prediction
+```
+
+完整 214,184,448 参数基座，rank=8/alpha=16 新增 **1,837,056** 个可训练参数（112 个张量，约为基座的 0.858%）；56 个目标层。FP32、RTX3090、完整 240×121 输入，在两个样本上分别从同一基座独立完成三步 SGD。样本0 loss 从 0.102370024 降至 0.102362894；样本1从 0.098202184 降至 0.098195232。所有适配参数梯度存在且有限，适配权重保存/加载的输出逐点相同。样本1还检查了冻结权重前后 SHA256 完全一致。峰值 allocated 显存约 19.1 GiB，单步约 7.5–7.9 秒（含梯度检查，不是标准性能 benchmark）。
+
+报告 `training.json` 区分总参数和可训练参数，记录每一步 loss、全部适配梯度范数、冻结权重哈希和 checkpoint roundtrip；`adapter.pdparams` / `adapter_config.json` 只保存低秩适配参数及目标层清单，必须与原基座配套使用。不要把 LoRA adapter 当作完整模型 checkpoint。`--lora-rank 0` 是全参数路线；此前完整全参数 FP32 反向在 24GB 卡上遇到 OOM，**尚未通过**。
+
+此检查使用原版支持的变量/纬度加权 MSE，固定一个样本和噪声，验证可训练性，不是原论文默认的 ensemble CRPS 训练、训练收敛或正式泛化评估。第一步 A 的梯度可因 B 零初始化而为零，这是标准 LoRA 初始化行为。新增回归覆盖零初始化输出不变、重计算前反向一致、冻结权重不变与 adapter 保存加载。
+
+样本1的 adapter 已通过独立推理进程加载，在未参与该次更新的样本2上完成 24h 预报；对原 Triton sparse / Torch SDPA 基线，82变量最差 RMSE 退化 0.54587%，仍在内部 1% 筛查内。这里只是相邻日期的微调后检查，不是独立跨季节泛化测试，也不能据此宣称 LoRA 提升了预报精度。
 
 ### 天气任务指标筛查
 

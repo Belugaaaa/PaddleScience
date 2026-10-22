@@ -27,7 +27,11 @@ from pathlib import Path
 import numpy as np
 
 
-def online_sparse_attention(q, k, v, indices, block_size, query_chunk_size=8):
+def online_sparse_attention(
+    q, k, v, indices, block_size, query_chunk_size=8, recompute_chunks=False
+):
+    if recompute_chunks:
+        raise ValueError("Native emulation does not support training recomputation")
     import paddle
 
     if paddle.is_grad_enabled():

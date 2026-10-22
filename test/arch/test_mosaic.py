@@ -15,6 +15,7 @@
 """Mosaic routing gradients and native checkpoint regression tests."""
 
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 
@@ -158,6 +159,73 @@ class TestMosaic(unittest.TestCase):
                 actual = loaded(inputs)["forecast"].numpy()
         np.testing.assert_array_equal(actual, expected)
         self.assertEqual(actual.shape, (1, 1, 4, 3, 1))
+
+        # All parameters (including the noise generator) must receive the same
+        # gradient with nested block/chunk recomputation. Input tensors do not
+        # require gradients, as in real fine-tuning.
+        model.train()
+        loaded.train()
+        loaded.set_recompute(True)
+        regular = model(inputs)["forecast"]
+        checked = loaded(inputs)["forecast"]
+        np.testing.assert_array_equal(regular.numpy(), checked.numpy())
+        regular.square().mean().backward()
+        checked.square().mean().backward()
+        for (name, param), (other_name, other) in zip(
+            model.named_parameters(), loaded.named_parameters()
+        ):
+            self.assertEqual(name, other_name)
+            self.assertIsNotNone(param.grad, name)
+            self.assertIsNotNone(other.grad, name)
+            np.testing.assert_allclose(
+                param.grad.numpy(),
+                other.grad.numpy(),
+                atol=1e-6,
+                rtol=1e-5,
+                err_msg=name,
+            )
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples/mosaic"))
+        from lora import adapter_state
+        from lora import inject_lora
+        from lora import load_adapter
+
+        loaded.clear_gradients()
+        frozen = {name: p.numpy().copy() for name, p in loaded.named_parameters()}
+        with paddle.no_grad():
+            before_lora = loaded(inputs)["forecast"].numpy()
+        manifest = inject_lora(loaded, rank=2, alpha=4)
+        self.assertTrue(manifest["targets"])
+        with paddle.no_grad():
+            np.testing.assert_array_equal(
+                loaded(inputs)["forecast"].numpy(), before_lora
+            )
+        trainable = [p for p in loaded.parameters() if not p.stop_gradient]
+        optimizer = paddle.optimizer.SGD(learning_rate=0.01, parameters=trainable)
+        for _ in range(2):
+            loaded(inputs)["forecast"].square().mean().backward()
+            for param in trainable:
+                self.assertIsNotNone(param.grad)
+                self.assertTrue(bool(paddle.isfinite(param.grad).all()))
+            optimizer.step()
+            optimizer.clear_grad()
+        for name, param in loaded.named_parameters():
+            if param.stop_gradient:
+                # Paddle may retain an allocated zero gradient from the earlier
+                # full-training part of this test after clear_gradient().
+                if param.grad is not None:
+                    np.testing.assert_array_equal(param.grad.numpy(), 0)
+                np.testing.assert_array_equal(
+                    param.numpy(), frozen[name.replace(".base.", ".")]
+                )
+        with tempfile.TemporaryDirectory() as directory, paddle.no_grad():
+            path = Path(directory) / "adapter.pdparams"
+            expected = loaded(inputs)["forecast"].numpy()
+            paddle.save(adapter_state(loaded), str(path))
+            for param in adapter_state(loaded).values():
+                param.set_value(paddle.zeros_like(param))
+            load_adapter(loaded, path)
+            np.testing.assert_array_equal(loaded(inputs)["forecast"].numpy(), expected)
 
     def test_full_grid_static_normalization(self):
         # Exercise the production-size reduction without constructing the 214M model.

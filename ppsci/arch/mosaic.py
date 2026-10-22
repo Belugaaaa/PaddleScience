@@ -102,6 +102,7 @@ class CrossAttentionInterpolate(nn.Layer):
     def __init__(self, cfg):
         super().__init__()
         self.k_neighbors = cfg.k_neighbors
+        self.enable_recompute = False
         self.num_heads = cfg.num_heads
         self.scale = (cfg.dim // cfg.num_heads) ** -0.5
         self.kv_norm = RMSNorm(cfg.dim, cfg.rmsnorm_elementwise_affine)
@@ -133,7 +134,26 @@ class CrossAttentionInterpolate(nn.Layer):
             n=2,
             h=self.num_heads,
         )
-        k, v = kv[0][self.neighbors], kv[1][self.neighbors]
+        if self.enable_recompute and self.training and paddle.is_grad_enabled():
+            from paddle.distributed.fleet.utils import recompute
+
+            return paddle.concat(
+                [
+                    recompute(
+                        self._interpolate_chunk,
+                        q[start : start + 512],
+                        kv,
+                        self.neighbors[start : start + 512],
+                        use_reentrant=False,
+                    )
+                    for start in range(0, q.shape[0], 512)
+                ],
+                axis=0,
+            )
+        return self._interpolate_chunk(q, kv, self.neighbors)
+
+    def _interpolate_chunk(self, q, kv, neighbors):
+        k, v = kv[0][neighbors], kv[1][neighbors]
         scores = (q * k).sum(axis=-1, keepdim=True) * self.scale
         weights = F.softmax(scores.astype("float32"), axis=1).astype(k.dtype)
         out = (weights * v).sum(axis=1)
@@ -203,6 +223,7 @@ class UNetStage(nn.Layer):
     def __init__(self, cfg, stage, depth):
         super().__init__()
         self.nside = stage.nside
+        self.enable_recompute = False
         self.blocks = nn.LayerList(
             [
                 MosaicBlock(
@@ -214,7 +235,17 @@ class UNetStage(nn.Layer):
 
     def forward(self, x, z=None):
         for block in self.blocks:
-            x = block(x, z)
+            if self.enable_recompute and self.training and paddle.is_grad_enabled():
+                from paddle.distributed.fleet.utils import recompute
+
+                # Frozen input projection in LoRA mode still needs an input
+                # requiring gradients for reentrant parameter recomputation.
+                x.stop_gradient = False
+                # Reentrant outer blocks can contain non-reentrant chunk
+                # recomputation; nested saved_tensors_hooks are unsupported.
+                x = recompute(block, x, z, use_reentrant=True)
+            else:
+                x = block(x, z)
         return x
 
 
@@ -251,6 +282,7 @@ class Mosaic(base.Arch):
         self.input_keys, self.output_keys = input_keys, output_keys
         self.num_noise_samples = num_noise_samples
         self.noise_dim = config.noise_dim
+        self.enable_recompute = False
         self._validate_config()
         self.nside = config.cg_stage_cfgs[0].nside
         dim = config.dim
@@ -366,6 +398,27 @@ class Mosaic(base.Arch):
         if self.noise_dim:
             nn.initializer.Normal(std=0.01)(self.noise_generator.to_noise.weight)
 
+    def set_recompute(self, enabled=True):
+        """Opt in to block/interpolation and selected-chunk activation recomputation.
+
+        Only active in training with gradients enabled. Does not change checkpoint
+        keys or inference arithmetic. Explicit noise is sampled before recomputation.
+        """
+        self.enable_recompute = enabled
+        self.interp_to_hp.enable_recompute = enabled
+        self.interp_to_ll.enable_recompute = enabled
+        for stage in [*self.encoder_stages, self.bottleneck, *self.decoder_stages]:
+            stage.enable_recompute = enabled
+            for block in stage.blocks:
+                block.attention.enable_recompute = enabled
+
+    def _interpolate(self, layer, x):
+        if self.enable_recompute and self.training and paddle.is_grad_enabled():
+            from paddle.distributed.fleet.utils import recompute
+
+            return recompute(layer, x, use_reentrant=True)
+        return layer(x)
+
     def initialize_rope(self):
         if self.config.rope:
             for stage in [*self.encoder_stages, self.bottleneck, *self.decoder_stages]:
@@ -433,7 +486,7 @@ class Mosaic(base.Arch):
             ],
             axis=-1,
         )
-        x = self.interp_to_hp(self.preprocess(x))
+        x = self._interpolate(self.interp_to_hp, self.preprocess(x))
         skips = []
         for encoder, down in zip(self.encoder_stages, self.downsample_layers):
             x = encoder(x, z)
@@ -444,7 +497,9 @@ class Mosaic(base.Arch):
             self.decoder_stages, self.upsample_layers, reversed(skips)
         ):
             x = decoder(up(x, skip), z)
-        x = self.postprocess(self.interp_to_ll(self.norm_before_interp_ll(x)))
+        x = self.postprocess(
+            self._interpolate(self.interp_to_ll, self.norm_before_interp_ll(x))
+        )
         x = rearrange(
             x,
             "(lon lat) (b n s) c -> b (n s) lon lat c",

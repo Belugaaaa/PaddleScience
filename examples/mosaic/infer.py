@@ -44,6 +44,16 @@ def main(args):
         )
     model.set_state_dict(state)
     del state
+    adapter_manifest = None
+    if args.adapter:
+        from lora import inject_lora
+        from lora import load_adapter
+
+        manifest = json.loads((args.adapter / "adapter_config.json").read_text())
+        adapter_manifest = inject_lora(model, manifest["rank"], manifest["alpha"])
+        if adapter_manifest != manifest:
+            raise ValueError("LoRA manifest does not match model targets")
+        load_adapter(model, args.adapter / "adapter.pdparams")
     if args.reference_trace:
         # Diagnostic only: isolate regenerated geometry from forward arithmetic.
         reference = np.load(args.reference_trace)
@@ -164,6 +174,8 @@ def main(args):
     report = dict(
         device=args.device,
         model_directory=str(args.model.resolve()),
+        adapter_directory=str(args.adapter.resolve()) if args.adapter else None,
+        adapter_config=adapter_manifest,
         conversion=(
             json.loads((args.model / "conversion.json").read_text())
             if (args.model / "conversion.json").exists()
@@ -208,6 +220,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--adapter", type=Path, help="Optional LoRA adapter directory")
     parser.add_argument("--static", type=Path, required=True)
     parser.add_argument("--stats", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
