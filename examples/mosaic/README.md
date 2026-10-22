@@ -85,6 +85,38 @@ python-paddle examples/mosaic/infer.py \
 
 样本1的 adapter 已通过独立推理进程加载，在未参与该次更新的样本2上完成 24h 预报；对原 Triton sparse / Torch SDPA 基线，82变量最差 RMSE 退化 0.54587%，仍在内部 1% 筛查内。这里只是相邻日期的微调后检查，不是独立跨季节泛化测试，也不能据此宣称 LoRA 提升了预报精度。
 
+### 多日期/跨季节批量评估
+
+对不同日期分别运行 `prepare_data.py --samples 1 --init-time ...`，例如 `2020-04-02T00:00`、`2020-07-02T00:00` 和 `2020-10-02T00:00`，保留其 JSON 数据清单。以下入口每份数据只取样本0，在指定GPU上串行启动隔离的 Torch/Paddle 进程，不将跨季节数据错误地作为连续滚动序列：
+
+```bash
+python-paddle examples/mosaic/evaluate_seasons.py \
+  --data /path/to/april.npz /path/to/july.npz /path/to/october.npz \
+  --model /path/to/paddle-era5-source-geometry \
+  --source /path/to/original-mosaic --checkpoint /path/to/era5_best.pt \
+  --static /path/to/static_vars.npz --stats /path/to/norm_stats_era5.npz \
+  --adapter /path/to/lora_run \
+  --paddle-python /path/to/paddle/bin/python \
+  --torch-python /path/to/torch/bin/python --gpu 0 \
+  --output /path/to/new_seasonal_run
+```
+
+`--adapter` 可省略。输出目录必须是新目录，以免误用旧预测。每个日期分别保存原版、Paddle 基座、可选 LoRA 输出及日志；使用相同显式噪声种子2026、FP32、24h一步。逐日期报告保留完整82变量指标；`suite.json` 汇总时先平均各日期 MSE 再开方，同时要求聚合和每个“日期×变量”均满足内部阈值，超限非零退出。单测专门覆盖聚合通过但单日期超限的情况。
+
+评估日期应与LoRA训练日期分离，脚本不自动推断训练数据划分，调用者需检查。原版参考仍为原 Triton sparse + Torch SDPA，不是 FlashAttention 完整基线。少量季节样本不能代替全年评估、集合概率评分或ACC；没有气候态时不报告ACC。
+
+2026-10-22 完成上述三个初始化日期，沿用冬季训练的rank8 adapter，均未参与本轮评估日期更新。以下为82变量中相对原 Triton sparse / SDPA 的最差天气 RMSE 退化：
+
+| 初始化日期 | Paddle 基座 | LoRA | 超过内部1%的变量 |
+| --- | ---: | ---: | --- |
+| 2020-04-02 | 1.55258% | 1.55067% | geopotential_100 |
+| 2020-07-02 | 1.04204% | 1.04089% | vertical_velocity_400 |
+| 2020-10-02 | 0.01790% | 0.01580% | 无 |
+
+三日期聚合82变量最差退化为基座0.22827%、LoRA0.22661%；但两者均有2/246个“日期×变量”超限，因此整轮报告是 **`screening_failed`，非零退出**，不能以聚合通过代替逐样本通过。三个日期的基座/LoRA所有变量均优于持续性预报。LoRA相对Paddle基座的最差额外RMSE退化0.01894%，没有修复原始稀疏内核路径差异。
+
+对两个超线样本补跑Torch数学稀疏参考后，Paddle基座逐变量天气RMSE最差退化分别为春季0.00034075%、夏季0.00057557%；最大归一化输出差分别0.00180244/0.00235176。数学参考非常接近，但原始Triton路径下仍超线，说明不能将两类基线混为“原版精度通过”，也不能断言BF16转换是全部根因。跨季节逐样本筛查是当前明确的待解决项。
+
 ### 天气任务指标筛查
 
 `evaluate_weather.py` 在物理量空间使用 FP64 计算逐变量余弦纬度加权 RMSE，对比原版预测及持续性预报（沿用最后一帧）。内部暂定所有变量 RMSE 相对原版退化不超过 1%，同时报告每个样本的最差退化；不是甲方验收标准，也不等同于统计显著性结论。没有气候态数据时不报告 ACC。

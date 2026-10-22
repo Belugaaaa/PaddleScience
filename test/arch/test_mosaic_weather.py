@@ -22,11 +22,48 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples/mosaic"))
 from evaluate_weather import weighted_mse  # noqa: E402
+from evaluate_seasons import aggregate_reports  # noqa: E402
+from presets import VARIABLES  # noqa: E402
 from rollout import forecast_rollout  # noqa: E402
 from rollout import validate_era5_sequence  # noqa: E402
 
 
 class TestMosaicWeather(unittest.TestCase):
+    def test_seasonal_aggregation_and_case_guard(self):
+        def report(actual, reference):
+            return {
+                "variables": {
+                    name: dict(
+                        actual_rmse=actual,
+                        reference_rmse=reference,
+                        persistence_rmse=10.0,
+                    )
+                    for name in VARIABLES
+                }
+            }
+
+        result = aggregate_reports([report(1.0, 1.0), report(3.0, 2.0)], 40)
+        self.assertAlmostEqual(
+            result["variables"][VARIABLES[0]]["actual_rmse"], np.sqrt(5)
+        )
+        self.assertAlmostEqual(
+            result["variables"][VARIABLES[0]]["reference_rmse"], np.sqrt(2.5)
+        )
+        # Aggregate regression is 41.4%, but the second individual case is 50%.
+        self.assertAlmostEqual(result["worst_case_regression_percent"], 50)
+        self.assertFalse(result["every_case_variable_within_tolerance"])
+        result = aggregate_reports([report(1.0, 1.0), report(3.0, 2.0)], 45)
+        self.assertTrue(result["aggregate_all_variables_within_tolerance"])
+        self.assertFalse(result["every_case_variable_within_tolerance"])
+        for reports, tolerance in (
+            ([], 1),
+            ([report(1, 0)], 1),
+            ([report(float("nan"), 1)], 1),
+            ([report(1, 1)], -1),
+        ):
+            with self.assertRaises(ValueError):
+                aggregate_reports(reports, tolerance)
+
     def test_rollout_sequence_validation(self):
         data = dict(
             state=np.array([[0, 1], [1, 2], [2, 3]]), target=np.array([2, 3, 4])
