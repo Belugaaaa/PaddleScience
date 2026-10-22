@@ -1,0 +1,180 @@
+# Mosaic（迁移进行中）
+
+Paddle implementation of [maxxxzdn/mosaic](https://github.com/maxxxzdn/mosaic),
+*(Sparse) Attention to the Details: Preserving Spectral Fidelity in ML-based
+Weather Forecasting Models*, ICML 2026. Original code: Apache-2.0.
+
+当前实现包含 HEALPix U-Net、网格插值、局部/压缩/top-k 选块注意力、GQA、RoPE、条件噪声与 FFN，并注册为 `ppsci.arch.Mosaic`。原 Torch 自定义内核由可微 Paddle 算子实现，选块计算采用分块 gather，不构造全局 token attention 矩阵。
+
+## 环境
+
+安装 PaddleScience 的基础依赖及 `healpy`，并在仓库根目录设置：
+
+```bash
+export PYTHONPATH="$PWD:$PYTHONPATH"
+```
+
+PyTorch 参考与 Paddle 使用分离的环境。不要为了复现而降级其他任务的共享环境。
+
+## 可运行的最小结构对齐
+
+先克隆原始参考仓库，并检出 commit `30c5baef1dc76c5810caf84c449e46c7925b9aec`。以下命令在 PaddleScience 根目录执行，`python-torch`、`python-paddle` 分别代表对应环境的 Python：
+
+```bash
+python-torch examples/mosaic/validate_alignment.py \
+  --framework torch --source /path/to/mosaic \
+  --output /path/to/alignment
+
+python-paddle examples/mosaic/validate_alignment.py \
+  --framework paddle --output /path/to/alignment
+```
+
+Torch 端安装 `torch`、`einops`、`healpy`、`scikit-learn`；此结构对齐使用独立的数学 attention，不需要安装 FlashAttention。Paddle GPU 验证增加 `--device gpu:0`。
+
+参考程序产生固定合成输入、随机权重、显式噪声与三步 SGD 结果。Paddle 端先比较几何 buffer，再按模块名称转置所有 Linear 权重，比较预测、loss 和第一步全部参数梯度。报告写入 `alignment.json`，超出默认 `1e-4` 诊断阈值时退出失败。这个阈值仅用于本脚本，不代表甲方已确认的气象验收口径。
+
+覆盖其他分支时，对 Torch 命令增加 `--no-compression` 或 `--sparse-count 0 --noise-dim 0`，使用独立输出目录，随后运行对应 Paddle 命令。
+
+## 当前验证范围
+
+CPU 小配置三路 attention、no-compression、无选块/无噪声路径都已通过三步前反向对齐。第一轮三路 attention 的前向差约 `1.8e-7`，参数梯度差约 `7.5e-8`。GPU 同配置前向差约 `1.94e-7`、梯度差约 `8.94e-8`。
+
+上述小配置数据来自合成输入和随机小模型，不代表完整模型验收。
+
+官方 ERA5 checkpoint 已完成 SHA256 校验（`187df31a0caef3e934e4eb8a11506c9fea518ff0e02ce6d1f804fc6c8a78a940`），131/131 组参数转换成功，总参数 214,184,448。在真实 ERA5 2020-01-01/02 两帧输入上，完整模型已于 RTX 3090 跑通 2020-01-03 的一步预测，输出 `[1,1,240,121,82]` 均为有限值。
+
+**完整模型精度仍未通过**：相同输入、权重和显式噪声下，对 Torch 数学稀疏参考的最大归一化输出差 `0.0362911`、平均差 `4.84447e-5`；对原始 Triton 稀疏内核（局部/压缩路径使用 Torch SDPA）的最大差 `5.34369`、平均差 `0.0271917`。原 Triton 内部会转 BF16，但目前尚未逐层证明其是否为全部差异来源，需继续检查 top-k 路由及计算精度。不能用小模型结果覆盖此缺口。
+
+后续逐层诊断确认：气象输入完全相同，静态场归一化 buffer 最大差 `0.00106382`，插值方向 buffer 最大差约 `0.000622757`。已将 Paddle 静态场统计改为 FP64 累积，并增加完整 `240×121` 网格回归测试。以下结果来自同一真实输入、官方权重和显式噪声，对照 Torch 数学参考：
+
+| 运行方式 | 最大归一化输出差 | 平均差 | RMSE |
+| --- | ---: | ---: | ---: |
+| 初始实现，重新生成几何 | 0.0362911 | 4.84447e-5 | 1.54551e-4 |
+| FP64 静态场统计，重新生成几何 | 0.0155888 | 3.14834e-5 | 7.77365e-5 |
+| 转换时保留原版全部 65 个几何 buffer，独立推理 | 0.00986958 | 1.65025e-5 | 1.00459e-4 |
+| 相同几何并强制使用参考路由（仅诊断） | 0.00167274 | 8.26601e-6 | 2.22763e-5 |
+
+保留原版几何后第一层线性投影完全一致，仍有一组 top-k 选块集合不同。其余若干索引差异只是集合内顺序不同。固定路由结果不能作为独立推理验收，所有结果仍仅限单样本。不能断言剩余误差完全由路由造成。
+
+真实数据训练/正式评估、滚动预测、完整模型 CINN 和 CI 尚待完成。
+
+### 天气任务指标筛查
+
+`evaluate_weather.py` 在物理量空间使用 FP64 计算逐变量余弦纬度加权 RMSE，对比原版预测及持续性预报（沿用最后一帧）。内部暂定所有变量 RMSE 相对原版退化不超过 1%，同时报告每个样本的最差退化；不是甲方验收标准，也不等同于统计显著性结论。没有气候态数据时不报告 ACC。
+
+`infer.py` 和 `reference_forecast.py` 默认只运行 `--sample-index 0`，可指定其他样本；报告记录数据路径、索引和噪声种子，评估器拒绝来源/精度不匹配及运行时强制几何/路由的结果。`--amp-dtype float16` 可诊断原版默认 autocast 路径，当前正式候选仍为 FP32 数学 attention。
+
+```bash
+python-paddle examples/mosaic/evaluate_weather.py \
+  --data /path/to/era5_sample.npz --stats /path/to/norm_stats_era5.npz \
+  --actual /path/to/paddle_run --reference /path/to/torch_native_run \
+  --sample-index 0 --output /path/to/weather_report.json
+```
+
+多个样本分别运行两个推理脚本，再为 `--actual`、`--reference`、`--sample-index` 依次提供等长列表。聚合时先平均各样本 MSE，再开方，不能直接平均 RMSE；相邻日期仍不能代表跨季节正式测试集。
+
+首个真实样本（2020-01-02 初始化，24h 预报），独立 Paddle 数学 attention 与原 Triton sparse / Torch SDPA 对照、均 FP32：82 个变量全部通过上述内部筛查，最差退化为 2 米温度的 0.43974%；其 RMSE 分别为 0.77260 K 和 0.76922 K。所有变量优于持续性预报。此结果只说明这一样本的任务误差未明显退化，不能用来证明原版内核逐点对齐或整体迁移完成。
+
+扩展至 2020-01-02/03/04 三个初始化日期的独立 24h 预报后：82 个变量的聚合 RMSE 最差退化 `0.13484%`，全部 246 个“样本×变量”组合的最差退化 `0.54617%`，均满足内部 1% 筛查线。这里没有自回归滚动，也没有多季节覆盖；不代表原版内核逐点对齐或正式任务验收。
+
+### 短期自回归滚动
+
+两个推理入口均支持 `--rollout-steps 3`（默认 1），需要至少三份连续样本的目标帧。只用第一个样本的两帧历史初始化，后续将模型预测反归一化后滚动写入历史；不读取真实下一帧作为输入。每步噪声由相同 NumPy RNG 顺序生成，时间增量匹配原版 ERA5 `[1, 4/365.25]`。这是 ERA5 24h 专用诊断，不用于 HRES。
+
+```bash
+# 分别运行 infer.py 和 reference_forecast.py，均增加 --rollout-steps 3
+python-paddle examples/mosaic/evaluate_rollout.py \
+  --data /path/to/era5_three_samples.npz --stats /path/to/norm_stats_era5.npz \
+  --actual /path/to/paddle_rollout --reference /path/to/torch_rollout \
+  --output /path/to/rollout_report.json
+```
+
+2020-01-02 单初始化、FP32、独立路由，原版 Triton sparse / SDPA 对照的结果：
+
+| 预报时效 | 82 变量中最差 RMSE 退化 | 2m 温度 Paddle / 原版 RMSE (K) |
+| --- | ---: | ---: |
+| 24h | 0.43974% | 0.77260 / 0.76922 |
+| 48h | 0.89308% | 1.04105 / 1.04592 |
+| 72h | 0.79301% | 1.35253 / 1.37131 |
+
+所有变量、所有时效满足内部 1% 筛查线。只验证一个初始化日期、一个噪声种子，仍缺跨季节和长滚动评估。测试覆盖历史反馈、时间推进、显式噪声序列和原输入不被修改。
+
+持续性基线方面：24h/48h 的 82 变量全部优于持续性预报；72h 有 81/82 优于该基线，例外为 `temperature_50`（Paddle 2.61719 K、原版 2.62429 K、持续性 2.53312 K）。不能将相对原版不退化表述为每个变量均具有预报优势。
+
+## 数据和权重
+
+原模型使用 WeatherBench2 ERA5/HRES 1.5° 数据。官方 HF 权重入口已重定向为 [AMLab-UvA/mosaic](https://huggingface.co/AMLab-UvA/mosaic)，初始验证锁定 revision `c2aaa3e0799e2a0e8fba8c79beb6d3ba8e2a4954`。ERA5 与 HRES 的历史帧数、时间步长、邻居数和归一化统计不同，不能互换。
+
+采样输入字典：`state` 为 `[B,N,history,lon,lat,channels]`，`time` 为 `[B,N,2]` 的日/年进度，可选 `noise` 为 `[B*N*samples,noise_dim]` 的标准正态输入。模型输出是归一化预报，需要按官方统计反归一化后评估。
+
+模型调用前必须用相同经纬度、静态变量分别调用 `initialize_static_vars` 和 `initialize_interpolation`，以建立确定性的几何状态。
+
+## 官方权重与真实输入复现命令
+
+下载 HF 的 `checkpoints/era5_best.pt`、`data/static_vars.npz`、`data/norm_stats_era5.npz` 后执行：
+
+```bash
+python-torch examples/mosaic/convert_checkpoint.py --stage export \
+  --input /path/to/era5_best.pt --output /path/to/era5_weights.npz \
+  --expected-sha256 187df31a0caef3e934e4eb8a11506c9fea518ff0e02ce6d1f804fc6c8a78a940
+
+python-paddle examples/mosaic/convert_checkpoint.py --stage convert \
+  --input /path/to/era5_weights.npz --variant era5 \
+  --static /path/to/static_vars.npz --output /path/to/paddle-era5
+
+python-paddle examples/mosaic/prepare_data.py --samples 1 \
+  --init-time 2020-01-02T00:00 --output /path/to/era5_sample.npz
+
+python-paddle examples/mosaic/infer.py --model /path/to/paddle-era5 \
+  --static /path/to/static_vars.npz --stats /path/to/norm_stats_era5.npz \
+  --data /path/to/era5_sample.npz --device gpu:0 --output /path/to/predictions
+```
+
+数据提取依赖 `zarr<3`、`fsspec[http]`、`pandas`，仅读取需要的时间块，不下载整个 ERA5。转换时严格校验所有可训练参数名称和形状，几何 buffer 重新生成并保存。
+
+若要精确保留原版预处理，在下面的 Torch 对照运行中增加 `--geometry-output /path/to/source_geometry.npz`，然后重新执行转换命令并增加 `--geometry /path/to/source_geometry.npz`。转换器要求覆盖全部 65 个 buffer，并检查名称、形状、dtype、有限值，记录来源 SHA256；原版输出的带 `buffer.` 前缀 trace NPZ 也可作为该参数的输入。此方式不会依赖运行时 Torch，也不会冻结选块路由。原生 checkpoint 已包含静态场和网格，切换经纬度/静态输入时必须重新初始化对应 buffer，不能沿用旧网格。
+
+`reference_forecast.py --help` 给出原网络对照入口，`--sparse-backend native` 使用原 Triton 稀疏内核（需 Triton/GPU），`math` 使用 chunked Torch SDPA。两者的局部/压缩路径均为 Torch SDPA，当前不是原版 FlashAttention 端到端基线。
+
+## 编译器诊断
+
+```bash
+python-paddle examples/mosaic/benchmark.py \
+  --fixture /path/to/alignment --device gpu:0 \
+  --output /path/to/cinn_small.json
+```
+
+此脚本使用结构对齐的小模型、固定权重和显式噪声；分别记录首次编译、预热后的动态/静态耗时及输出差。不能用其代替完整模型正式 CINN 验收。
+
+完整权重可用 `benchmark.py --model /path/to/paddle_model --static ... --stats ... --data ... --output ... --device gpu:0 --warmup 2 --steps 5` 探测，不能同时传 `--fixture`。先进行动态预热和同步计时，再记录编译/首次执行，随后静态预热和计时，最后比较输出；当前完整模型仍属探测阶段。编译失败会保留错误和动态基线；若外部限时终止，报告会停留在最后已保存阶段，不能将其视为完成。
+
+完整 ERA5 权重、真实单样本、RTX3090 的两次探测吞吐提升分别 22.73% / 22.52%。第二次 warmup3/steps10：动态 1.46270s、CINN 1.19380s、编译首次执行 229.283s。最大输出差 0.00216770、平均差 1.31741e-5，严格 `atol=1e-4` **失败**，脚本非零退出；与此同时编译后逐变量天气 RMSE 相对动态最差退化仅 0.000602857%，单样本任务筛查通过。报告分开记录两项结论，不能以任务误差小覆盖严格输出失败。完整输出保存在报告同名 `.npz`，便于后续定位。尚非多样本/滚动编译验证或正式 CINN 验收。
+
+完整模型 benchmark 增加 `--samples 3`，使用同一个编译图依次检查前三个真实输入，计时仍只使用第一个样本。报告 `cases` 为逐样本差异，`task_metric_screening.aggregate_variables` 为先平均 MSE 再开方的聚合天气指标。为兼容既有报告，顶层 `max_diff`/`mean_diff` 及 `task_metric_screening.variables` 仍描述样本0；跨样本严格判定看 `precision_pass` 和 `multi_sample_worst_diff`。
+
+注意 Paddle `to_static(layer)` 会原地替换 `layer.forward`：脚本保留编译前的绑定方法作为后续样本的动态基线，不能调用已转换的同一 Layer 假装动态对照。该行为有独立回归测试。
+
+2026-10-22 三样本结果：动态1.46553s、CINN1.19144s，吞吐提升23.0056%，编译首次226.332s。三个样本动态输出与此前独立动态运行逐点完全一致。每个样本最大输出差分别0.00216770/0.00197840/0.00360155，严格atol1e-4仍失败。单个样本×变量的最差天气RMSE退化0.00108478%，聚合82变量最差退化0.000412214%，所有样本任务筛查通过。只在样本0计时，精度覆盖三个相邻日期，未验证编译后自回归滚动。CINN保持可选诊断，不作为默认或已完成验收的后端。
+
+首次 GPU 诊断记录：106,592 参数，动态 14.2357ms，CINN 3.69774ms，吞吐提升 284.985%，输出 max diff 1.49e-7；首次编译及执行 135.137s。该结果仅限上述小配置。
+
+完整精度诊断可在 `infer.py` 和 `reference_forecast.py` 增加 `--trace`：逐层保留最多 16,384 个抽样元素，完整保存第一层输入、所有几何 buffer 和 top-k 路由索引。因此完整模型 trace 可达数百 MB，并会引入同步/CPU 拷贝开销，开启后的耗时不能用于性能比较。
+
+```bash
+python-paddle examples/mosaic/compare_traces.py \
+  --paddle /path/to/paddle_trace_run --reference /path/to/torch_trace_run \
+  --output /path/to/comparison.json
+```
+
+对比脚本将选块集合变化和集合内顺序变化分开统计，不输出验收结论。`infer.py --reference-trace` 可替换几何、`--reference-routes` 可冻结路由，二者均为隔离诊断开关，报告会明确标记，不能将其当作独立迁移结果。
+
+原始 Triton BF16 在线 softmax 的独立前向诊断：
+
+```bash
+python-torch examples/mosaic/validate_sparse_kernel.py --framework torch \
+  --source /path/to/mosaic --output /path/to/kernel_check
+python-paddle examples/mosaic/validate_sparse_kernel.py --framework paddle \
+  --output /path/to/kernel_check --device gpu:0
+```
+
+固定输入 `[1,512,4,64]`、两组 KV heads、块长 128、每次选 3 块，数学 Paddle 算子对原 Triton 的 max diff 为 `0.00276860`，按原版 BF16 转换和逐块在线 softmax 顺序模拟后为 `0.000205725`（平均差 `2.41152e-7`）。仍非逐位一致，且未验证自定义反向；该模拟仅在示例诊断代码中，不替换架构中的可微数学 attention。
