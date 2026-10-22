@@ -14,9 +14,9 @@
 
 """Real-input FP32 full-weight or LoRA diagnostic, not a training reproduction.
 
-Uses the reference's variable/latitude weighted MSE with one ensemble member.
-Checks every parameter gradient and performs SGD updates with fixed sample/noise.
-It is NOT the paper's ensemble CRPS training schedule or an independent skill test.
+Supports reference variable/latitude weighted MSE, MAE and fair ensemble CRPS.
+Checks every trainable gradient and performs SGD updates with fixed sample/noise.
+It is NOT the paper's full training schedule or an independent skill test.
 """
 
 import argparse
@@ -32,6 +32,8 @@ from convert_checkpoint import initialize_model
 from lora import adapter_state
 from lora import inject_lora
 from lora import load_adapter
+from losses import ensemble_forecast
+from losses import weighted_loss
 from presets import LEVELS
 from presets import PRESSURE_VARIABLES
 from presets import SURFACE_VARIABLES
@@ -63,7 +65,9 @@ def frozen_digest(model):
 def main(args):
     if args.steps < 1 or not 0 < args.learning_rate < 1:
         raise ValueError("Require steps >= 1 and 0 < learning-rate < 1")
-    args.output.mkdir(parents=True, exist_ok=True)
+    if args.members < 1 or (args.loss == "crps" and args.members < 2):
+        raise ValueError("Positive members required; fair CRPS needs >=2")
+    args.output.mkdir(parents=True, exist_ok=False)
     report = dict(
         status="initializing",
         steps=[],
@@ -77,7 +81,9 @@ def main(args):
         optimizer="SGD",
         learning_rate=args.learning_rate,
         training_mode="lora" if args.lora_rank else "full",
-        scope="trainability diagnostic; fixed real sample/noise; not CRPS training reproduction or generalization evaluation",
+        loss_type=args.loss,
+        ensemble_members=args.members,
+        scope="trainability diagnostic; fixed real sample/noise; not paper training reproduction or generalization evaluation",
     )
 
     def save():
@@ -93,6 +99,7 @@ def main(args):
             raise ValueError("Checkpoint key mismatch")
         model.set_state_dict(state)
         del state
+        paddle.seed(args.seed)
         if args.lora_rank:
             report["lora"] = inject_lora(model, args.lora_rank, args.lora_alpha)
         model.set_recompute(not args.no_recompute)
@@ -121,7 +128,7 @@ def main(args):
                 ),
                 noise=paddle.to_tensor(
                     np.random.default_rng(args.seed)
-                    .standard_normal((1, config["noise_dim"]))
+                    .standard_normal((args.members, config["noise_dim"]))
                     .astype("float32")
                 ),
             )
@@ -148,11 +155,18 @@ def main(args):
             learning_rate=args.learning_rate, parameters=[p for _, p in params]
         )
         report["status"] = "training"
+
+        def forecast():
+            return ensemble_forecast(model, inputs, args.members, not args.no_recompute)
+
+        def score(prediction):
+            return weighted_loss(prediction, target, weights, args.loss)
+
         save()
         for step in range(args.steps):
             started = time.perf_counter()
-            prediction = model(inputs)["forecast"]
-            loss = ((prediction - target).square() * weights).mean()
+            prediction = forecast()
+            loss = score(prediction)
             value = float(loss)
             if not np.isfinite(value):
                 raise ValueError("Non-finite training loss")
@@ -187,9 +201,7 @@ def main(args):
             )
             del prediction, loss
         with paddle.no_grad():
-            after = float(
-                ((model(inputs)["forecast"] - target).square() * weights).mean()
-            )
+            after = float(score(forecast()))
         report["final_loss"] = after
         report["fixed_sample_loss_decreased"] = bool(
             np.isfinite(after) and after < report["steps"][0]["loss"]
@@ -206,11 +218,11 @@ def main(args):
                 json.dumps(report["lora"], indent=2)
             )
             with paddle.no_grad():
-                expected = model(inputs)["forecast"].numpy()
+                expected = forecast().numpy()
                 for param in adapter_state(model).values():
                     param.set_value(paddle.zeros_like(param))
                 load_adapter(model, adapter_path)
-                restored = model(inputs)["forecast"].numpy()
+                restored = forecast().numpy()
             np.testing.assert_array_equal(expected, restored)
             report["adapter_roundtrip_exact"] = True
         if args.save_checkpoint:
@@ -248,4 +260,6 @@ if __name__ == "__main__":
         "--lora-rank", type=int, default=0, help="0: full training; positive: LoRA"
     )
     parser.add_argument("--lora-alpha", type=float, default=16)
+    parser.add_argument("--members", type=int, default=1)
+    parser.add_argument("--loss", choices=("mse", "mae", "crps"), default="mse")
     main(parser.parse_args())

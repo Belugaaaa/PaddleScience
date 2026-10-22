@@ -214,6 +214,28 @@ class TestMosaic(unittest.TestCase):
         np.testing.assert_array_equal(actual, expected)
         self.assertEqual(actual.shape, (1, 1, 4, 3, 1))
 
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples/mosaic"))
+        from losses import ensemble_forecast
+
+        ensemble_inputs = dict(inputs, noise=paddle.randn([3, 4]))
+        loaded.train()
+        regular_ensemble = ensemble_forecast(loaded, ensemble_inputs, 3, False)
+        regular_ensemble.square().mean().backward()
+        expected_grads = {
+            name: p.grad.numpy().copy() for name, p in loaded.named_parameters()
+        }
+        loaded.clear_gradients()
+        checked_ensemble = ensemble_forecast(loaded, ensemble_inputs, 3, True)
+        np.testing.assert_array_equal(
+            regular_ensemble.numpy(), checked_ensemble.numpy()
+        )
+        checked_ensemble.square().mean().backward()
+        for name, param in loaded.named_parameters():
+            np.testing.assert_allclose(
+                param.grad.numpy(), expected_grads[name], atol=1e-6, rtol=1e-5
+            )
+        loaded.clear_gradients()
+
         # All parameters (including the noise generator) must receive the same
         # gradient with nested block/chunk recomputation. Input tensors do not
         # require gradients, as in real fine-tuning.

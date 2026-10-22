@@ -23,12 +23,42 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples/mosaic"))
 from evaluate_weather import weighted_mse  # noqa: E402
 from evaluate_seasons import aggregate_reports  # noqa: E402
+from losses import weighted_loss  # noqa: E402
+import paddle  # noqa: E402
 from presets import VARIABLES  # noqa: E402
 from rollout import forecast_rollout  # noqa: E402
 from rollout import validate_era5_sequence  # noqa: E402
 
 
 class TestMosaicWeather(unittest.TestCase):
+    def test_fair_crps_value_and_gradients(self):
+        paddle.set_device("cpu")
+        paddle.seed(42)
+        prediction = paddle.randn([2, 3, 4, 3, 2])
+        prediction.stop_gradient = False
+        target = paddle.randn([2, 1, 4, 3, 2])
+        weights = paddle.rand([1, 1, 1, 3, 2])
+        actual = weighted_loss(prediction, target, weights, "crps")
+        pairwise = (prediction.unsqueeze(2) - prediction.unsqueeze(1)).abs()
+        expected = (
+            (prediction - target).abs().mean(axis=1, keepdim=True) * weights
+        ).mean() - (pairwise.sum(axis=(1, 2)).unsqueeze(1) * weights).mean() / 12
+        np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=1e-6)
+        first = paddle.grad(actual, prediction, retain_graph=True)[0]
+        second = paddle.grad(expected, prediction)[0]
+        np.testing.assert_allclose(first.numpy(), second.numpy(), atol=1e-7)
+        for kind in ("mse", "mae"):
+            error = prediction - target
+            expected = (
+                (error.square() if kind == "mse" else error.abs()) * weights
+            ).mean()
+            np.testing.assert_allclose(
+                weighted_loss(prediction, target, weights, kind).numpy(),
+                expected.numpy(),
+            )
+        with self.assertRaises(ValueError):
+            weighted_loss(prediction[:, :1], target, weights, "crps")
+
     def test_seasonal_aggregation_and_case_guard(self):
         def report(actual, reference):
             return {

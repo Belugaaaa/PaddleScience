@@ -85,6 +85,31 @@ python-paddle examples/mosaic/infer.py \
 
 样本1的 adapter 已通过独立推理进程加载，在未参与该次更新的样本2上完成 24h 预报；对原 Triton sparse / Torch SDPA 基线，82变量最差 RMSE 退化 0.54587%，仍在内部 1% 筛查内。这里只是相邻日期的微调后检查，不是独立跨季节泛化测试，也不能据此宣称 LoRA 提升了预报精度。
 
+### 集合 fair-CRPS 训练与验证入口
+
+训练脚本支持 `--loss mse|mae|crps`、`--members N`。fair-CRPS 采用原版 `losses.py` 的无偏集合估计，排除自身配对，至少需要2个成员；在归一化空间施加相同变量/纬度权重。通过逐对累积避免分配完整的成员数平方空间张量。它与物理单位RMSE不同，也不能用单日期小集合证明概率校准效果。
+
+```bash
+python-paddle examples/mosaic/train_smoke.py \
+  --model /path/to/paddle-era5-source-geometry \
+  --static /path/to/static_vars.npz --stats /path/to/norm_stats_era5.npz \
+  --data /path/to/era5_three_samples.npz --output /path/to/new_crps_run \
+  --device gpu:0 --sample-index 1 --steps 10 \
+  --lora-rank 8 --learning-rate 0.001 --members 2 --loss crps
+
+python-paddle examples/mosaic/evaluate_ensemble.py \
+  --model /path/to/paddle-era5-source-geometry --adapter /path/to/new_crps_run \
+  --static /path/to/static_vars.npz --stats /path/to/norm_stats_era5.npz \
+  --data /path/to/era5_three_samples.npz --sample-index 2 \
+  --members 2 --device gpu:0 --output /path/to/new_ensemble_evaluation
+```
+
+各成员使用显式独立噪声，逐成员运行单成员模型；训练时外层重计算释放成员图，内部保留已有的block/chunk重计算。入口目前只支持每batch一份历史上下文（N=1），不把多个时间窗混成集合。`--no-recompute` 关闭此省显存功能；大模型可能OOM。训练输出目录必须新建，防止混入旧adapter；随机种子在LoRA初始化前设置，保证初始化可复现。
+
+`evaluate_ensemble.py` 在同样噪声下分别运行基座和adapter，保存完整成员预测、归一化加权fair-CRPS、成员MSE、集合平均预报的物理RMSE与spread。拒绝训练报告中相同数据路径/样本索引的检查；不同文件的重叠日期仍须调用者核对。单测覆盖fair-CRPS与独立全配对公式的数值/梯度，以及逐成员重计算与普通模式的全部参数梯度一致性。固定样本更新仍属训练检查，不是论文训练流程或收敛复现。
+
+2026-10-22 两成员FP32、rank8 LoRA、真实ERA5样本1、固定噪声的十步SGD检查通过：fair-CRPS从0.081527159降至0.081524864；全部112个适配参数张量梯度存在且有限，冻结基座SHA256前后相同，adapter保存加载后所有成员输出逐点相同。峰值allocated21,036,877,568bytes（约19.6GiB），每步含检查约19.1–19.4s。独立样本2集合评估中，adapter相对基座的82变量集合平均RMSE最差退化0.00069105%，加权归一化fair-CRPS变化-8.27e-7。这里只是相邻日期、2成员、十步固定样本检查，不证明统计显著收益或泛化收敛。
+
 ### 多日期/跨季节批量评估
 
 对不同日期分别运行 `prepare_data.py --samples 1 --init-time ...`，例如 `2020-04-02T00:00`、`2020-07-02T00:00` 和 `2020-10-02T00:00`，保留其 JSON 数据清单。以下入口每份数据只取样本0，在指定GPU上串行启动隔离的 Torch/Paddle 进程，不将跨季节数据错误地作为连续滚动序列：
