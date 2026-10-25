@@ -20,6 +20,7 @@ strict output checks separate from limited physical weather metric screening.
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -27,6 +28,18 @@ import numpy as np
 import paddle
 
 from ppsci.arch.mosaic import Mosaic
+
+
+def compiler_environment():
+    """Record explicit compiler overrides; absence means the runtime default."""
+    names = (
+        "FLAGS_cinn_nvrtc_cubin_with_fmad",
+        "FLAGS_use_fast_math",
+        "FLAGS_deny_cinn_ops",
+        "FLAGS_allow_cinn_ops",
+        "FLAGS_enable_fuse_parallel_matmul_pass",
+    )
+    return {name: os.environ.get(name) for name in names}
 
 
 def sync(device):
@@ -84,6 +97,7 @@ def main(args):
         warmup=args.warmup,
         steps=args.steps,
         parameters=int(model.num_params),
+        compiler_environment=compiler_environment(),
     )
     with paddle.no_grad():
         dynamic, reference = timed(model, inputs, args.warmup, args.steps, args.device)
@@ -159,6 +173,7 @@ def full_model(args):
         steps=args.steps,
         status="started",
         paddle_version=paddle.__version__,
+        compiler_environment=compiler_environment(),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -274,7 +289,7 @@ def full_model(args):
         passed = all(case["max_diff"] <= args.atol for case in cases)
         np.savez(args.output.with_suffix(".npz"), **saved_outputs)
         report.update(
-            status="complete",
+            status="complete" if passed else "failed",
             static_seconds=static_seconds,
             max_diff=float(delta.max()),
             mean_diff=float(delta.mean()),
