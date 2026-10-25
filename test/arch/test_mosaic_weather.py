@@ -21,10 +21,10 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples/mosaic"))
-from evaluate_weather import weighted_mse  # noqa: E402
-from evaluate_seasons import aggregate_reports  # noqa: E402
-from losses import weighted_loss  # noqa: E402
 import paddle  # noqa: E402
+from evaluate_seasons import aggregate_reports  # noqa: E402
+from evaluate_weather import weighted_mse  # noqa: E402
+from losses import weighted_loss  # noqa: E402
 from presets import VARIABLES  # noqa: E402
 from rollout import forecast_rollout  # noqa: E402
 from rollout import validate_era5_sequence  # noqa: E402

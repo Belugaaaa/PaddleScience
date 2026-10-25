@@ -59,7 +59,9 @@ def ensemble_forecast(model, inputs, members, recompute_members=True):
         raise ValueError("Require positive members and single-member base model")
     state, phase, noise = inputs["state"], inputs["time"], inputs["noise"]
     if state.shape[1] != 1:
-        raise ValueError("Ensemble training helper supports one forecast context per batch")
+        raise ValueError(
+            "Ensemble training helper supports one forecast context per batch"
+        )
     if noise.shape[0] != members * state.shape[0] * state.shape[1]:
         raise ValueError("Noise batch does not match requested ensemble")
     batch = state.shape[0] * state.shape[1]
